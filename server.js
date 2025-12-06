@@ -1,278 +1,363 @@
-// ===== 100% RELIABLE DRONE GCS SERVER =====
+// ===== GLOBAL DRONE CONTROL SERVER - RENDER DEPLOYMENT READY =====
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
+
+// ===== GLOBAL CORS CONFIGURATION =====
+app.use(cors({
+  origin: '*',  // Allow ALL origins for global access
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  credentials: false
+}));
+
+// ===== WEBSOCKET WITH GLOBAL SUPPORT =====
 const io = new Server(server, {
-  cors: { origin: "*" },
-  transports: ['polling'] // Most reliable for Render
+  cors: {
+    origin: "*",  // Allow all origins
+    methods: ["GET", "POST"]
+  },
+  pingInterval: 25000,    // Send ping every 25s
+  pingTimeout: 60000,     // Wait 60s for pong
+  transports: ['websocket', 'polling']
 });
 
 const PORT = process.env.PORT || 3000;
 
-// ===== DATA STORES =====
-const commandQueues = new Map();    // droneId -> [commands]
-const telemetryStore = new Map();   // droneId -> [telemetry]
-const connectedWebClients = new Set();
+// ===== GLOBAL DATA STORES =====
+const drones = new Map();           // droneId -> {info, lastSeen, commands[]}
+const connectedClients = new Map(); // socketId -> {type: 'web'|'drone', droneId}
+const telemetryHistory = new Map(); // droneId -> [telemetryData]
 
 // ===== MIDDLEWARE =====
 app.use(express.json());
 app.use(express.static('public'));
 
-// ===== HEALTH & STATUS =====
+// ===== HEALTH ENDPOINTS (RENDER MONITORING) =====
 app.get('/health', (req, res) => {
   res.json({
     status: 'online',
-    service: 'drone-gcs',
-    drones: Array.from(commandQueues.keys()),
-    webClients: connectedWebClients.size,
-    uptime: process.uptime()
+    service: 'global-drone-control',
+    timestamp: new Date().toISOString(),
+    drones: Array.from(drones.keys()).length,
+    clients: connectedClients.size,
+    uptime: process.uptime(),
+    region: process.env.REGION || 'global',
+    version: '1.0-global'
   });
 });
 
 app.get('/status', (req, res) => {
+  const status = {
+    online: true,
+    drones: Array.from(drones.entries()).map(([id, data]) => ({
+      id,
+      online: Date.now() - data.lastSeen < 30000, // 30s timeout
+      commandsPending: data.commands.length,
+      lastSeen: new Date(data.lastSeen).toISOString(),
+      ip: data.ip || 'unknown'
+    })),
+    webClients: Array.from(connectedClients.values())
+      .filter(c => c.type === 'web').length,
+    droneClients: Array.from(connectedClients.values())
+      .filter(c => c.type === 'drone').length
+  };
+  res.json(status);
+});
+
+// ===== DRONE API (GLOBAL ACCESS) =====
+
+// 1. DRONE REGISTRATION (4G/WiFi)
+app.post('/api/drone/register', (req, res) => {
+  const { droneId, firmware, capabilities } = req.body;
+  const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+  
+  console.log(`🛩️  Drone REGISTER: ${droneId} from ${ip}`);
+  
+  drones.set(droneId, {
+    id: droneId,
+    ip: ip,
+    firmware: firmware || 'unknown',
+    capabilities: capabilities || [],
+    commands: [],
+    lastSeen: Date.now(),
+    registeredAt: new Date().toISOString()
+  });
+  
   res.json({
-    drones: Array.from(commandQueues.keys()).map(id => ({
-      id: id,
-      pendingCommands: (commandQueues.get(id) || []).length,
-      lastTelemetry: telemetryStore.has(id) ? 
-        telemetryStore.get(id).slice(-1)[0] : null
-    }))
+    success: true,
+    message: `Drone ${droneId} registered globally`,
+    serverTime: new Date().toISOString(),
+    endpoint: `/api/drone/${droneId}/commands`
   });
 });
 
-// ===== DRONE API (HTTP - 100% RELIABLE) =====
-
-// 1. Drone polls for commands
+// 2. DRONE POLL FOR COMMANDS (4G/WiFi Friendly)
 app.get('/api/drone/:droneId/commands', (req, res) => {
   const droneId = req.params.droneId;
-  const commands = commandQueues.get(droneId) || [];
+  const drone = drones.get(droneId);
   
-  console.log(`🤖 ${droneId} polled, ${commands.length} commands pending`);
+  if (!drone) {
+    return res.status(404).json({ error: 'Drone not registered' });
+  }
+  
+  // Update last seen
+  drone.lastSeen = Date.now();
+  
+  // Get pending commands
+  const commands = drone.commands;
+  
+  console.log(`📡 ${droneId} polled from ${drone.ip}, ${commands.length} commands`);
+  
+  // Clear commands after sending
+  drone.commands = [];
   
   res.json({
     success: true,
     droneId: droneId,
     commands: commands,
     timestamp: Date.now(),
+    nextPoll: Date.now() + 3000, // Suggest next poll in 3s
     serverTime: new Date().toISOString()
   });
-  
-  // Clear delivered commands
-  commandQueues.set(droneId, []);
 });
 
-// 2. Drone sends telemetry
+// 3. DRONE SEND TELEMETRY (GLOBAL FORWARDING)
 app.post('/api/drone/:droneId/telemetry', (req, res) => {
   const droneId = req.params.droneId;
-  const { data, battery, gps, altitude } = req.body;
+  const telemetry = req.body;
   
-  const telemetry = {
+  if (!drones.has(droneId)) {
+    return res.status(404).json({ error: 'Drone not found' });
+  }
+  
+  // Update drone last seen
+  const drone = drones.get(droneId);
+  drone.lastSeen = Date.now();
+  
+  // Add timestamp
+  const telemetryData = {
+    ...telemetry,
     droneId,
-    data: data || 'heartbeat',
-    battery: battery || 100,
-    gps: gps || '0,0',
-    altitude: altitude || 0,
     timestamp: Date.now(),
-    serverTime: new Date().toISOString()
+    serverTime: new Date().toISOString(),
+    receivedAt: new Date().toISOString()
   };
   
-  // Store telemetry
-  if (!telemetryStore.has(droneId)) {
-    telemetryStore.set(droneId, []);
+  // Store in history
+  if (!telemetryHistory.has(droneId)) {
+    telemetryHistory.set(droneId, []);
   }
-  telemetryStore.get(droneId).push(telemetry);
+  telemetryHistory.get(droneId).push(telemetryData);
   
-  // Keep only last 100 entries
-  if (telemetryStore.get(droneId).length > 100) {
-    telemetryStore.set(droneId, telemetryStore.get(droneId).slice(-100));
+  // Keep only last 100 telemetry entries
+  if (telemetryHistory.get(droneId).length > 100) {
+    telemetryHistory.set(droneId, telemetryHistory.get(droneId).slice(-100));
   }
   
-  console.log(`📊 Telemetry from ${droneId}:`, data || 'heartbeat');
+  console.log(`📊 Telemetry from ${droneId}: ${telemetry.data || 'heartbeat'}`);
   
-  // Broadcast to all web clients via Socket.io
-  io.emit('telemetry', telemetry);
+  // BROADCAST TO ALL WEB CLIENTS (GLOBAL)
+  io.emit('telemetry', telemetryData);
   
   res.json({
     success: true,
-    received: telemetry
+    received: telemetryData
   });
 });
 
-// 3. Send command to drone (from web)
+// 4. WEB CLIENT SEND COMMAND (FROM ANYWHERE)
 app.post('/api/drone/:droneId/command', (req, res) => {
   const droneId = req.params.droneId;
-  const { command, priority = 1 } = req.body;
+  const { command, priority = 1, params } = req.body;
   
   if (!command) {
     return res.status(400).json({ error: 'Command required' });
   }
   
-  // Initialize queue if not exists
-  if (!commandQueues.has(droneId)) {
-    commandQueues.set(droneId, []);
+  if (!drones.has(droneId)) {
+    return res.status(404).json({ error: 'Drone not found' });
   }
   
-  // Add command to queue
+  const drone = drones.get(droneId);
+  
+  // Create command object
   const cmdObj = {
+    id: `cmd_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
     command: command,
     priority: priority,
+    params: params || {},
     timestamp: Date.now(),
-    serverTime: new Date().toISOString()
+    serverTime: new Date().toISOString(),
+    status: 'queued'
   };
   
-  commandQueues.get(droneId).push(cmdObj);
+  // Add to drone's command queue
+  drone.commands.push(cmdObj);
   
-  console.log(`🎯 Command to ${droneId}: ${command}`);
+  console.log(`🌍 GLOBAL Command to ${droneId}: ${command}`);
   
-  // Also emit via Socket.io for real-time web updates
+  // Broadcast to all web clients
   io.emit('command-sent', {
     droneId: droneId,
     command: command,
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    from: 'api'
   });
   
   res.json({
     success: true,
-    droneId: droneId,
-    command: command,
+    message: `Command sent to ${droneId}`,
+    commandId: cmdObj.id,
     queuedAt: new Date().toISOString(),
-    queuePosition: commandQueues.get(droneId).length
+    estimatedDelivery: Date.now() + 5000, // 5s estimate for 4G
+    queuePosition: drone.commands.length
   });
 });
 
-// 4. Get drone telemetry history (for web)
-app.get('/api/drone/:droneId/telemetry/history', (req, res) => {
+// 5. GET DRONE INFO (PUBLIC STATUS)
+app.get('/api/drone/:droneId', (req, res) => {
   const droneId = req.params.droneId;
-  const limit = parseInt(req.query.limit) || 50;
+  const drone = drones.get(droneId);
   
-  const history = telemetryStore.get(droneId) || [];
-  const recent = history.slice(-limit);
+  if (!drone) {
+    return res.status(404).json({ error: 'Drone not found' });
+  }
   
   res.json({
     success: true,
-    droneId: droneId,
-    count: recent.length,
-    telemetry: recent
+    drone: {
+      id: drone.id,
+      online: Date.now() - drone.lastSeen < 30000,
+      lastSeen: new Date(drone.lastSeen).toISOString(),
+      registered: drone.registeredAt,
+      ip: drone.ip,
+      firmware: drone.firmware,
+      pendingCommands: drone.commands.length
+    }
   });
 });
 
-// ===== WEB SOCKET (for real-time web updates) =====
+// ===== WEBSOCKET CONNECTION (GLOBAL CLIENTS) =====
 io.on('connection', (socket) => {
-  console.log(`📱 Web client connected: ${socket.id}`);
-  connectedWebClients.add(socket.id);
+  console.log(`🌐 New global connection: ${socket.id} from ${socket.handshake.address}`);
   
-  // Send initial status
-  socket.emit('init', {
-    drones: Array.from(commandQueues.keys()),
-    serverTime: new Date().toISOString()
-  });
-  
-  // Handle commands from web
-  socket.on('command', (data) => {
-    const { droneId = 'all', command } = data;
+  socket.on('identify', (data) => {
+    const { type, droneId } = data;
     
-    console.log(`🎯 Web command from ${socket.id}: ${command} to ${droneId}`);
-    
-    if (droneId === 'all') {
-      // Send to all drones
-      Array.from(commandQueues.keys()).forEach(id => {
-        if (!commandQueues.has(id)) commandQueues.set(id, []);
-        commandQueues.get(id).push({
-          command: command,
-          timestamp: Date.now(),
-          source: 'web'
-        });
+    if (type === 'drone') {
+      // Drone connecting via WebSocket (alternative to HTTP)
+      connectedClients.set(socket.id, { type: 'drone', droneId });
+      console.log(`🛩️  Drone ${droneId} connected via WebSocket`);
+      
+      // Send welcome
+      socket.emit('welcome', {
+        message: 'Drone connected globally',
+        serverTime: new Date().toISOString(),
+        updateInterval: 3000
       });
     } else {
-      // Send to specific drone
-      if (!commandQueues.has(droneId)) commandQueues.set(droneId, []);
-      commandQueues.get(droneId).push({
-        command: command,
-        timestamp: Date.now(),
-        source: 'web'
+      // Web client (GCS from anywhere in world)
+      connectedClients.set(socket.id, { type: 'web', droneId: data.droneId || 'all' });
+      console.log(`🖥️  GCS client connected from ${socket.handshake.address}`);
+      
+      // Send initial data
+      socket.emit('init', {
+        drones: Array.from(drones.keys()),
+        serverTime: new Date().toISOString(),
+        connectionId: socket.id
       });
     }
-    
-    // Broadcast to all web clients
-    io.emit('command-issued', {
-      from: socket.id,
-      droneId: droneId,
-      command: command,
-      timestamp: Date.now()
-    });
   });
   
+  // Handle commands from GCS (global)
+  socket.on('command', (data) => {
+    const { droneId = 'drone-001', command } = data;
+    
+    console.log(`🎯 Global WebSocket command: ${command} to ${droneId}`);
+    
+    if (drones.has(droneId)) {
+      const drone = drones.get(droneId);
+      drone.commands.push({
+        command: command,
+        timestamp: Date.now(),
+        source: 'websocket',
+        socketId: socket.id
+      });
+      
+      // Broadcast to all clients
+      io.emit('command-issued', {
+        from: socket.id,
+        droneId: droneId,
+        command: command,
+        timestamp: Date.now()
+      });
+    }
+  });
+  
+  // Handle disconnection
   socket.on('disconnect', () => {
-    console.log(`📱 Web client disconnected: ${socket.id}`);
-    connectedWebClients.delete(socket.id);
+    const client = connectedClients.get(socket.id);
+    if (client) {
+      console.log(`🔌 ${client.type} disconnected: ${socket.id}`);
+      connectedClients.delete(socket.id);
+    }
   });
 });
 
-// ===== WEB INTERFACE ROUTES =====
+// ===== PUBLIC WEB INTERFACE =====
 app.get('/', (req, res) => {
   res.sendFile(__dirname + '/public/index.html');
 });
 
-app.get('/api/telemetry/latest', (req, res) => {
-  const latest = {};
-  
-  telemetryStore.forEach((telemetry, droneId) => {
-    if (telemetry.length > 0) {
-      latest[droneId] = telemetry[telemetry.length - 1];
-    }
-  });
-  
-  res.json({
-    success: true,
-    latest: latest,
-    timestamp: Date.now()
-  });
-});
-
-// ===== START SERVER =====
+// ===== SERVER START =====
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
-🚀 =================================================
-🚀   DRONE GCS - 100% RELIABLE EDITION
-🚀 =================================================
-🌐 HTTP REST API:   Port ${PORT}
-📡 Web Interface:   https://your-app.onrender.com
-📊 Health Check:    /health
-🤖 Drone Endpoints:
-   GET  /api/drone/:id/commands      - Poll for commands
-   POST /api/drone/:id/telemetry     - Send telemetry
-   POST /api/drone/:id/command       - Send command
-📲 WebSocket:       Real-time updates
-🚀 =================================================
-✅ Server ready for unlimited range drone control
-🚀 =================================================
+🌍 ======================================================
+🌍   GLOBAL DRONE CONTROL SERVER - DEPLOYMENT READY
+🌍 ======================================================
+📍 Server URL:  https://your-app.onrender.com
+📍 Local URL:   http://localhost:${PORT}
+📍 Health Check: /health
+📍 Status Page:  /status
+📡 Endpoints:
+   POST /api/drone/register     - Drone registration (4G/WiFi)
+   GET  /api/drone/:id/commands - Poll for commands
+   POST /api/drone/:id/telemetry- Send telemetry
+   POST /api/drone/:id/command  - Send command from anywhere
+   GET  /api/drone/:id          - Get drone status
+🌍 ======================================================
+✅ Ready for GLOBAL control via 4G/WiFi from anywhere!
+🌍 ======================================================
   `);
 });
 
+// ===== AUTO CLEANUP (Remove offline drones) =====
+setInterval(() => {
+  const now = Date.now();
+  let removed = 0;
+  
+  for (const [droneId, drone] of drones.entries()) {
+    if (now - drone.lastSeen > 300000) { // 5 minutes offline
+      drones.delete(droneId);
+      removed++;
+      console.log(`🧹 Removed offline drone: ${droneId}`);
+    }
+  }
+  
+  if (removed > 0) {
+    console.log(`🧹 Cleanup: Removed ${removed} offline drones`);
+  }
+}, 60000); // Run every minute
+
 // ===== ERROR HANDLING =====
 process.on('uncaughtException', (err) => {
-  console.error('❌ Uncaught Exception:', err);
+  console.error('❌ Global Server Error:', err);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  console.error('❌ Unhandled Rejection:', reason);
 });
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\n🔴 Shutting down gracefully...');
-  
-  io.emit('server-shutdown', { message: 'Maintenance', time: new Date().toISOString() });
-  
-  setTimeout(() => {
-    server.close(() => {
-      console.log('🛑 Server stopped');
-      process.exit(0);
-    });
-  }, 1000);
-});
-
-module.exports = { app, server, io };
