@@ -1,135 +1,103 @@
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
+const { WebSocketServer } = require('ws');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server);
 
-const PORT = process.env.PORT || 3000;
-
-// Store connected clients
-const webClients = new Map();    // Web UI clients
-const droneClients = new Map();  // Drone clients
-
-// ===== MIDDLEWARE =====
-app.use(express.static('public'));
-
-// Health endpoint
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'online',
-        drones: droneClients.size,
-        webClients: webClients.size
-    });
+// ===== LAYER 1: Socket.io (HTTP Long-polling fallback) =====
+const io = new Server(server, {
+  cors: { origin: "*" },
+  transports: ['polling', 'websocket'], // Polling first for reliability
+  pingInterval: 25000,
+  pingTimeout: 60000
 });
 
-// Root endpoint
-app.get('/', (req, res) => {
-    res.sendFile(__dirname + '/public/index.html');
+// ===== LAYER 2: Pure WebSocket (for ESP32) =====
+const wss = new WebSocketServer({ noServer: true });
+
+// Handle upgrade to WebSocket
+server.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+  
+  if (pathname === '/drone-ws') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
 });
 
-// ===== WEB CLIENT NAMESPACE =====
-io.of('/web').on('connection', (socket) => {
-    console.log(`📱 Web client connected: ${socket.id}`);
-    webClients.set(socket.id, socket);
-    
-    // Send current status
-    socket.emit('status', {
-        drones: Array.from(droneClients.keys()),
-        timestamp: Date.now()
-    });
-    
-    // Handle commands from web
-    socket.on('command', (data) => {
-        console.log(`🎯 Command from ${socket.id}:`, data);
-        
-        const command = typeof data === 'object' ? data.command : data;
-        
-        // Send to all drones
-        droneClients.forEach((droneSocket, droneId) => {
-            droneSocket.emit('command', command);
-            console.log(`📤 To drone ${droneId}: ${command}`);
-        });
-    });
-    
-    socket.on('disconnect', () => {
-        console.log(`📱 Web client disconnected: ${socket.id}`);
-        webClients.delete(socket.id);
-    });
+// WebSocket connections
+wss.on('connection', (ws) => {
+  console.log('🤖 Drone connected via raw WebSocket');
+  
+  ws.on('message', (data) => {
+    console.log('📥 Raw WS:', data.toString());
+    // Broadcast to Socket.io clients
+    io.emit('drone-data', data.toString());
+  });
+  
+  ws.on('close', () => {
+    console.log('🤖 Drone disconnected (WS)');
+  });
 });
 
-// ===== DRONE CLIENT NAMESPACE =====
-io.of('/drone').on('connection', (socket) => {
-    console.log(`🤖 Drone connected: ${socket.id}`);
-    
-    // Request drone registration
-    socket.emit('request-registration');
-    
-    socket.on('register', (data) => {
-        const droneId = data.droneId || `drone_${socket.id}`;
-        console.log(`✅ Drone registered: ${droneId}`);
-        
-        droneClients.set(droneId, socket);
-        
-        // Notify all web clients
-        io.of('/web').emit('drone-connected', { droneId: droneId });
-        
-        // Send confirmation to drone
-        socket.emit('registered', { 
-            droneId: droneId,
-            serverTime: Date.now()
-        });
-    });
-    
-    // Handle telemetry from drone
-    socket.on('telemetry', (data) => {
-        const droneId = Array.from(droneClients.entries())
-            .find(([id, sock]) => sock.id === socket.id)?.[0] || socket.id;
-        
-        console.log(`📥 Telemetry from ${droneId}:`, data);
-        
-        // Broadcast to all web clients
-        io.of('/web').emit('telemetry', {
-            droneId: droneId,
-            data: data,
-            timestamp: Date.now()
-        });
-    });
-    
-    socket.on('disconnect', () => {
-        const droneId = Array.from(droneClients.entries())
-            .find(([id, sock]) => sock.id === socket.id)?.[0];
-        
-        if (droneId) {
-            console.log(`🤖 Drone disconnected: ${droneId}`);
-            droneClients.delete(droneId);
-            io.of('/web').emit('drone-disconnected', { droneId: droneId });
-        }
-    });
+// ===== LAYER 3: HTTP REST API (Most reliable) =====
+app.post('/api/drone/command', express.json(), (req, res) => {
+  const { droneId, command } = req.body;
+  console.log(`📨 HTTP Command to ${droneId}: ${command}`);
+  
+  // Store command for drone to fetch
+  commandQueue.push({ droneId, command, timestamp: Date.now() });
+  res.json({ success: true, queued: true });
 });
 
-// ===== START SERVER =====
-server.listen(PORT, '0.0.0.0', () => {
-    console.log('🚀 ============================================');
-    console.log('🚀   DRONE GCS - WEBSOCKET EDITION            ');
-    console.log('🚀 ============================================');
-    console.log(`🌐 Server running on port ${PORT}`);
-    console.log(`📡 Web namespace: /web`);
-    console.log(`🤖 Drone namespace: /drone`);
-    console.log('🚀 ============================================');
+app.get('/api/drone/poll/:droneId', (req, res) => {
+  const { droneId } = req.params;
+  const commands = commandQueue.filter(cmd => cmd.droneId === droneId);
+  
+  res.json({
+    commands: commands,
+    timestamp: Date.now()
+  });
+  
+  // Clear delivered commands
+  commandQueue = commandQueue.filter(cmd => cmd.droneId !== droneId);
 });
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\n🔴 Shutting down...');
+const commandQueue = [];
+
+// ===== MAIN LOGIC =====
+io.on('connection', (socket) => {
+  console.log('📱 Web client connected');
+  
+  socket.on('command', (data) => {
+    console.log('🎯 Command:', data);
     
-    // Notify all clients
-    io.of('/web').emit('server-shutdown');
-    io.of('/drone').emit('server-shutdown');
+    // Try WebSocket first
+    wss.clients.forEach(client => {
+      if (client.readyState === 1) {
+        client.send(JSON.stringify({ type: 'command', data: data }));
+      }
+    });
     
-    setTimeout(() => {
-        server.close();
-        process.exit(0);
-    }, 1000);
+    // Also queue for HTTP poll
+    commandQueue.push({
+      droneId: 'broadcast',
+      command: data,
+      timestamp: Date.now()
+    });
+  });
+});
+
+server.listen(process.env.PORT || 3000, () => {
+  console.log(`
+🚀  TRIPLE-REDUNDANT DRONE GCS ONLINE
+├── 📡 HTTP REST API:    /api/drone/*
+├── 🔌 WebSocket:        /drone-ws
+└── 📲 Socket.io:        Auto-negotiated
+`);
 });
