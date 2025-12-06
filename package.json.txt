@@ -4,8 +4,7 @@
   "description": "Drone Ground Control Station",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -14,8 +13,5 @@
   },
   "engines": {
     "node": ">=16.0.0"
-  },
-  "keywords": ["drone", "esp32", "arduino", "gcs"],
-  "author": "Mini Surveillance Drone Project",
-  "license": "MIT"
+  }
 }
