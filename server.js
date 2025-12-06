@@ -1,185 +1,135 @@
-// ===== PRODUCTION DRONE GCS SERVER =====
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const net = require('net');
 
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
-// ===== CONFIGURATION =====
-const WEB_PORT = process.env.PORT || 3000;          // Render provides PORT
-const DRONE_TCP_PORT = process.env.TCP_PORT || 3001; // TCP for drones
-const ALLOWED_ORIGINS = process.env.ORIGINS || '*';  // CORS origins
+const PORT = process.env.PORT || 3000;
 
-const tcpClients = new Map(); // droneId -> socket
+// Store connected clients
+const webClients = new Map();    // Web UI clients
+const droneClients = new Map();  // Drone clients
 
-// ===== SECURITY MIDDLEWARE =====
-app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (ALLOWED_ORIGINS === '*' || ALLOWED_ORIGINS.includes(origin)) {
-        res.header('Access-Control-Allow-Origin', origin);
-    }
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    next();
-});
-
-// ===== STATIC SERVER =====
+// ===== MIDDLEWARE =====
 app.use(express.static('public'));
 
-// Health check endpoint for Render
+// Health endpoint
 app.get('/health', (req, res) => {
-    res.status(200).json({
+    res.json({
         status: 'online',
-        service: 'drone-gcs',
-        drones_connected: tcpClients.size,
-        uptime: process.uptime()
+        drones: droneClients.size,
+        webClients: webClients.size
     });
 });
 
-// ===== WEBSOCKET HANDLER =====
-io.on('connection', (socket) => {
-    console.log(`📱 Web client connected: ${socket.id} from ${socket.handshake.address}`);
+// Root endpoint
+app.get('/', (req, res) => {
+    res.sendFile(__dirname + '/public/index.html');
+});
+
+// ===== WEB CLIENT NAMESPACE =====
+io.of('/web').on('connection', (socket) => {
+    console.log(`📱 Web client connected: ${socket.id}`);
+    webClients.set(socket.id, socket);
     
-    // Send current drone status
-    const droneList = Array.from(tcpClients.keys());
-    socket.emit('system-status', {
-        drones_online: droneList.length,
-        drone_ids: droneList
+    // Send current status
+    socket.emit('status', {
+        drones: Array.from(droneClients.keys()),
+        timestamp: Date.now()
     });
     
-    // Command handler
+    // Handle commands from web
     socket.on('command', (data) => {
         console.log(`🎯 Command from ${socket.id}:`, data);
         
-        let commandToSend, targetDrone;
+        const command = typeof data === 'object' ? data.command : data;
         
-        // Parse command
-        if (typeof data === 'object') {
-            commandToSend = data.command || 'unknown';
-            targetDrone = data.droneId || 'all';
-        } else {
-            commandToSend = String(data);
-            targetDrone = 'all';
-        }
-        
-        // Forward to drone(s)
-        if (targetDrone === 'all') {
-            // Send to all drones
-            tcpClients.forEach((client, droneId) => {
-                if (client.writable) {
-                    client.write(commandToSend + '\n');
-                    console.log(`📤 To drone ${droneId}: ${commandToSend}`);
-                }
-            });
-        } else if (tcpClients.has(targetDrone)) {
-            // Send to specific drone
-            tcpClients.get(targetDrone).write(commandToSend + '\n');
-            console.log(`📤 To drone ${targetDrone}: ${commandToSend}`);
-        }
+        // Send to all drones
+        droneClients.forEach((droneSocket, droneId) => {
+            droneSocket.emit('command', command);
+            console.log(`📤 To drone ${droneId}: ${command}`);
+        });
     });
     
     socket.on('disconnect', () => {
         console.log(`📱 Web client disconnected: ${socket.id}`);
+        webClients.delete(socket.id);
     });
 });
 
-// ===== TCP SERVER FOR DRONES =====
-const tcpServer = net.createServer((socket) => {
-    const droneAddress = `${socket.remoteAddress}:${socket.remotePort}`;
-    let droneId = `drone_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+// ===== DRONE CLIENT NAMESPACE =====
+io.of('/drone').on('connection', (socket) => {
+    console.log(`🤖 Drone connected: ${socket.id}`);
     
-    console.log(`🤖 New drone connection: ${droneAddress}`);
+    // Request drone registration
+    socket.emit('request-registration');
     
-    // Store connection
-    tcpClients.set(droneId, socket);
+    socket.on('register', (data) => {
+        const droneId = data.droneId || `drone_${socket.id}`;
+        console.log(`✅ Drone registered: ${droneId}`);
+        
+        droneClients.set(droneId, socket);
+        
+        // Notify all web clients
+        io.of('/web').emit('drone-connected', { droneId: droneId });
+        
+        // Send confirmation to drone
+        socket.emit('registered', { 
+            droneId: droneId,
+            serverTime: Date.now()
+        });
+    });
     
-    // Send drone its assigned ID
-    socket.write(`ID:${droneId}\n`);
+    // Handle telemetry from drone
+    socket.on('telemetry', (data) => {
+        const droneId = Array.from(droneClients.entries())
+            .find(([id, sock]) => sock.id === socket.id)?.[0] || socket.id;
+        
+        console.log(`📥 Telemetry from ${droneId}:`, data);
+        
+        // Broadcast to all web clients
+        io.of('/web').emit('telemetry', {
+            droneId: droneId,
+            data: data,
+            timestamp: Date.now()
+        });
+    });
     
-    // Data handler
-    socket.on('data', (data) => {
-        try {
-            const message = data.toString().trim();
-            
-            if (message.startsWith('REG:')) {
-                // Drone registration with custom ID
-                const customId = message.split(':')[1];
-                if (customId) {
-                    tcpClients.delete(droneId);
-                    droneId = customId;
-                    tcpClients.set(droneId, socket);
-                    console.log(`🤖 Drone registered as: ${droneId}`);
-                }
-            }
-            
-            if (message.length > 0) {
-                console.log(`📥 From ${droneId}: ${message}`);
-                
-                // Broadcast telemetry to all web clients
-                io.emit('telemetry', {
-                    droneId: droneId,
-                    timestamp: Date.now(),
-                    data: message
-                });
-            }
-        } catch (error) {
-            console.error(`Error processing data from ${droneId}:`, error);
+    socket.on('disconnect', () => {
+        const droneId = Array.from(droneClients.entries())
+            .find(([id, sock]) => sock.id === socket.id)?.[0];
+        
+        if (droneId) {
+            console.log(`🤖 Drone disconnected: ${droneId}`);
+            droneClients.delete(droneId);
+            io.of('/web').emit('drone-disconnected', { droneId: droneId });
         }
     });
-    
-    // Cleanup on disconnect
-    socket.on('end', () => {
-        console.log(`🤖 Drone disconnected: ${droneId}`);
-        tcpClients.delete(droneId);
-        io.emit('drone-disconnected', { droneId: droneId });
-    });
-    
-    socket.on('error', (error) => {
-        console.error(`🤖 TCP error from ${droneId}:`, error.message);
-        tcpClients.delete(droneId);
-    });
-    
-    // Timeout handler
-    socket.setTimeout(30000, () => {
-        console.log(`⏰ Timeout for drone ${droneId}`);
-        socket.end();
-    });
 });
 
-// ===== START SERVERS =====
-tcpServer.listen(DRONE_TCP_PORT, '0.0.0.0', () => {
-    console.log(`📡 TCP Server listening on 0.0.0.0:${DRONE_TCP_PORT} for drones`);
-});
-
-server.listen(WEB_PORT, '0.0.0.0', () => {
+// ===== START SERVER =====
+server.listen(PORT, '0.0.0.0', () => {
     console.log('🚀 ============================================');
-    console.log('🚀   DRONE GCS - PRODUCTION DEPLOYMENT        ');
+    console.log('🚀   DRONE GCS - WEBSOCKET EDITION            ');
     console.log('🚀 ============================================');
-    console.log(`🌐 Web Interface:   http://0.0.0.0:${WEB_PORT}`);
-    console.log(`📡 Drone TCP Port:  ${DRONE_TCP_PORT}`);
-    console.log(`📊 Environment:     ${process.env.NODE_ENV || 'development'}`);
-    console.log('📡 Waiting for connections...');
-    console.log('🚀 ============================================\n');
+    console.log(`🌐 Server running on port ${PORT}`);
+    console.log(`📡 Web namespace: /web`);
+    console.log(`🤖 Drone namespace: /drone`);
+    console.log('🚀 ============================================');
 });
 
-// ===== GRACEFUL SHUTDOWN =====
+// Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\n🔴 Shutting down servers...');
+    console.log('\n🔴 Shutting down...');
     
-    tcpClients.forEach((client) => {
-        client.end('SERVER_SHUTDOWN');
-    });
-    
-    tcpServer.close();
-    server.close();
+    // Notify all clients
+    io.of('/web').emit('server-shutdown');
+    io.of('/drone').emit('server-shutdown');
     
     setTimeout(() => {
-        console.log('🛑 Servers stopped');
+        server.close();
         process.exit(0);
     }, 1000);
 });
-
-module.exports = { app, server, tcpServer }; // For testing
