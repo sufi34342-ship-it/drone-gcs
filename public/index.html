@@ -313,6 +313,38 @@
         ::-webkit-scrollbar-thumb:hover {
             background: var(--accent);
         }
+        
+        /* Keyboard overlay styles */
+        .key-help {
+            padding: 6px 10px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 4px;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.2);
+            transition: all 0.2s;
+            user-select: none;
+        }
+        
+        .key-help:hover {
+            background: rgba(255,255,255,0.15);
+            border-color: var(--accent);
+        }
+        
+        .active-key {
+            background: var(--primary) !important;
+            color: white !important;
+            box-shadow: 0 0 10px var(--primary);
+        }
+        
+        @keyframes pulseKey {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+        
+        .key-pulse {
+            animation: pulseKey 0.3s ease;
+        }
     </style>
 </head>
 <body>
@@ -824,6 +856,292 @@
         });
         
         console.log('DroneCommand Pro GCS fully initialized - Layout optimized');
+        
+        // ======================= KEYBOARD CONTROL SYSTEM =======================
+        // Added for laptop keyboard control - Works with existing sendCommand()
+        
+        // Key Mapping Configuration
+        const keyMap = {
+            // Movement Keys (Continuous while held)
+            'ArrowUp': 'forward',
+            'ArrowDown': 'backward',
+            'ArrowLeft': 'left', 
+            'ArrowRight': 'right',
+            'w': 'up',
+            'W': 'up',
+            's': 'down',
+            'S': 'down',
+            
+            // Rotation Keys (Continuous while held)
+            'a': 'yaw_left',
+            'A': 'yaw_left',
+            'd': 'yaw_right', 
+            'D': 'yaw_right',
+            'q': 'yaw_left',
+            'Q': 'yaw_left',
+            'e': 'yaw_right',
+            'E': 'yaw_right',
+            
+            // Instant Action Keys (Single press)
+            ' ': 'emergency_stop',          // Spacebar
+            'Enter': 'takeoff',             // Enter key (toggle takeoff/land)
+            '1': 'arm',
+            '2': 'disarm', 
+            '3': 'rth',
+            '4': 'hold',
+            '5': 'grid',
+            '6': 'perimeter',
+            '7': 'follow',
+            '8': 'mission_start',
+            'Escape': 'emergency_stop',     // ESC key also emergency stop
+            
+            // Function Keys
+            'F1': 'takeoff',
+            'F2': 'land',
+            'F3': 'rth',
+            'F4': 'hold',
+            'F5': 'grid', 
+            'F6': 'perimeter',
+            'F7': 'follow',
+            'F8': 'mission_start'
+        };
+        
+        // Track currently pressed keys
+        const activeKeys = new Set();
+        const commandTimers = {};
+        
+        // Key hold interval (ms between repeated commands)
+        const KEY_HOLD_INTERVAL = 200;
+        
+        // Create keyboard display overlay
+        function createKeyboardOverlay() {
+            const overlay = document.createElement('div');
+            overlay.id = 'keyboard-overlay';
+            overlay.style.cssText = `
+                position: fixed;
+                bottom: 120px;
+                left: 50%;
+                transform: translateX(-50%);
+                background: rgba(26, 39, 53, 0.95);
+                border: 2px solid var(--accent);
+                border-radius: 12px;
+                padding: 15px;
+                z-index: 9999;
+                display: none;
+                backdrop-filter: blur(10px);
+                box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            `;
+            
+            overlay.innerHTML = `
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
+                    <h4 style="margin: 0; color: var(--accent);">
+                        <i class="fas fa-keyboard"></i> Keyboard Controls Active
+                    </h4>
+                    <button id="close-keyboard-help" style="background: none; border: none; color: #aaa; cursor: pointer;">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; font-size: 12px;">
+                    <div class="key-help" data-key="ArrowUp">↑ Forward</div>
+                    <div class="key-help" data-key="ArrowDown">↓ Backward</div>
+                    <div class="key-help" data-key="ArrowLeft">← Left</div>
+                    <div class="key-help" data-key="ArrowRight">→ Right</div>
+                    <div class="key-help" data-key="w">W Up</div>
+                    <div class="key-help" data-key="s">S Down</div>
+                    <div class="key-help" data-key="a">A Yaw Left</div>
+                    <div class="key-help" data-key="d">D Yaw Right</div>
+                    <div class="key-help" data-key=" ">Space: Emergency</div>
+                    <div class="key-help" data-key="Enter">Enter: Takeoff</div>
+                    <div class="key-help" data-key="1">1: Arm</div>
+                    <div class="key-help" data-key="2">2: Disarm</div>
+                    <div class="key-help" data-key="3">3: RTH</div>
+                    <div class="key-help" data-key="Escape">ESC: Emergency</div>
+                    <div class="key-help" data-key="F1">F1: Takeoff</div>
+                    <div class="key-help" data-key="F2">F2: Land</div>
+                </div>
+                <div style="margin-top: 10px; font-size: 11px; color: #aaa; text-align: center;">
+                    Hold movement keys for continuous control | Browser tab must be active
+                </div>
+            `;
+            
+            document.body.appendChild(overlay);
+            
+            // Close button functionality
+            document.getElementById('close-keyboard-help').addEventListener('click', () => {
+                overlay.style.display = 'none';
+            });
+            
+            return overlay;
+        }
+        
+        // Initialize keyboard overlay
+        const keyboardOverlay = createKeyboardOverlay();
+        
+        // Show/hide key help on Ctrl+K
+        document.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key === 'k') {
+                e.preventDefault();
+                keyboardOverlay.style.display = keyboardOverlay.style.display === 'none' ? 'block' : 'none';
+            }
+        });
+        
+        // Start continuous command sending for a key
+        function startContinuousCommand(key, command) {
+            if (commandTimers[key]) {
+                clearInterval(commandTimers[key]);
+            }
+            
+            // Send immediately on key press
+            sendCommand(command);
+            showKeyPress(key, command);
+            
+            // Continue sending at interval while key held
+            commandTimers[key] = setInterval(() => {
+                sendCommand(command);
+            }, KEY_HOLD_INTERVAL);
+        }
+        
+        // Stop continuous command for a key
+        function stopContinuousCommand(key) {
+            if (commandTimers[key]) {
+                clearInterval(commandTimers[key]);
+                delete commandTimers[key];
+                
+                // Send stop command for movement keys
+                const command = keyMap[key];
+                if (['forward', 'backward', 'left', 'right', 'up', 'down', 'yaw_left', 'yaw_right'].includes(command)) {
+                    setTimeout(() => {
+                        sendCommand('hold'); // Stop movement when key released
+                    }, 50);
+                }
+                
+                showKeyRelease(key);
+            }
+        }
+        
+        // Visual feedback for key press
+        function showKeyPress(key, command) {
+            activeKeys.add(key);
+            
+            // Highlight in overlay
+            const keyElements = document.querySelectorAll(`.key-help[data-key="${key}"]`);
+            keyElements.forEach(el => {
+                el.style.background = 'var(--primary)';
+                el.style.color = 'white';
+                el.style.transform = 'scale(1.05)';
+                el.style.transition = 'all 0.1s';
+            });
+            
+            // Show notification for important keys
+            if ([' ', 'Enter', 'Escape', '1', '2', '3'].includes(key)) {
+                showToast(`${command.toUpperCase()} activated`);
+            }
+        }
+        
+        // Visual feedback for key release
+        function showKeyRelease(key) {
+            activeKeys.delete(key);
+            
+            // Remove highlight from overlay
+            const keyElements = document.querySelectorAll(`.key-help[data-key="${key}"]`);
+            keyElements.forEach(el => {
+                el.style.background = '';
+                el.style.color = '';
+                el.style.transform = '';
+            });
+        }
+        
+        // Handle keydown event
+        function handleKeyDown(e) {
+            // Prevent browser shortcuts when we want to control drone
+            const preventShortcuts = [' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'w', 'a', 's', 'd'];
+            if (preventShortcuts.includes(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                e.preventDefault();
+            }
+            
+            const command = keyMap[e.key];
+            if (command && !activeKeys.has(e.key)) {
+                // Continuous commands (movement/rotation)
+                if (['forward', 'backward', 'left', 'right', 'up', 'down', 'yaw_left', 'yaw_right'].includes(command)) {
+                    startContinuousCommand(e.key, command);
+                } 
+                // Instant commands (single press)
+                else {
+                    sendCommand(command);
+                    showKeyPress(e.key, command);
+                    
+                    // Special handling for Enter key (toggle takeoff/land)
+                    if (e.key === 'Enter') {
+                        setTimeout(() => showKeyRelease(e.key), 500);
+                    }
+                    
+                    // Special handling for number/function keys
+                    if (['1', '2', '3', '4', '5', '6', '7', '8', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8'].includes(e.key)) {
+                        setTimeout(() => showKeyRelease(e.key), 300);
+                    }
+                }
+            }
+        }
+        
+        // Handle keyup event
+        function handleKeyUp(e) {
+            const command = keyMap[e.key];
+            if (command) {
+                // Stop continuous commands
+                if (['forward', 'backward', 'left', 'right', 'up', 'down', 'yaw_left', 'yaw_right'].includes(command)) {
+                    stopContinuousCommand(e.key);
+                }
+                // Clear instant command highlights (except Space/Enter which handled differently)
+                else if (![' ', 'Enter'].includes(e.key)) {
+                    showKeyRelease(e.key);
+                }
+            }
+        }
+        
+        // Stop all continuous commands (emergency/cleanup)
+        function stopAllContinuousCommands() {
+            Object.keys(commandTimers).forEach(key => {
+                clearInterval(commandTimers[key]);
+            });
+            Object.keys(commandTimers).length = 0;
+            activeKeys.clear();
+            
+            // Clear all highlights
+            document.querySelectorAll('.key-help').forEach(el => {
+                el.style.background = '';
+                el.style.color = '';
+                el.style.transform = '';
+            });
+        }
+        
+        // Initialize keyboard controls
+        function initKeyboardControls() {
+            document.addEventListener('keydown', handleKeyDown);
+            document.addEventListener('keyup', handleKeyUp);
+            
+            // Stop all commands when window loses focus
+            window.addEventListener('blur', stopAllContinuousCommands);
+            
+            // Stop all commands when page is hidden
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) {
+                    stopAllContinuousCommands();
+                }
+            });
+            
+            console.log('🎮 Keyboard control system initialized');
+            addLog('Keyboard controls enabled - Press Ctrl+K for help');
+            
+            // Show brief help on first load
+            setTimeout(() => {
+                showToast('Keyboard controls active | Press Ctrl+K for help');
+            }, 2000);
+        }
+        
+        // Initialize when page loads
+        window.addEventListener('load', initKeyboardControls);
+        
+        console.log('DroneCommand Pro GCS fully initialized with keyboard controls');
     </script>
 </body>
 </html>
