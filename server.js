@@ -1,4 +1,4 @@
-// ===== GLOBAL DRONE CONTROL SERVER - RENDER DEPLOYMENT READY =====
+// ===== GLOBAL DRONE CONTROL SERVER - WITH CAMERA STREAMING =====
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -28,7 +28,7 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000;
 
 // ===== GLOBAL DATA STORES =====
-const drones = new Map();           // droneId -> {info, lastSeen, commands[]}
+const drones = new Map();           // droneId -> {info, lastSeen, commands[], camera}
 const connectedClients = new Map(); // socketId -> {type: 'web'|'drone', droneId}
 const telemetryHistory = new Map(); // droneId -> [telemetryData]
 
@@ -57,6 +57,7 @@ app.get('/status', (req, res) => {
       id,
       online: Date.now() - data.lastSeen < 30000, // 30s timeout
       commandsPending: data.commands.length,
+      cameraActive: data.camera ? Date.now() - data.camera.lastUpdate < 5000 : false,
       lastSeen: new Date(data.lastSeen).toISOString(),
       ip: data.ip || 'unknown'
     })),
@@ -84,7 +85,8 @@ app.post('/api/drone/register', (req, res) => {
     capabilities: capabilities || [],
     commands: [],
     lastSeen: Date.now(),
-    registeredAt: new Date().toISOString()
+    registeredAt: new Date().toISOString(),
+    camera: null  // Initialize camera storage
   });
   
   res.json({
@@ -169,7 +171,127 @@ app.post('/api/drone/:droneId/telemetry', (req, res) => {
   });
 });
 
-// 4. WEB CLIENT SEND COMMAND (FROM ANYWHERE)
+// ===== CAMERA STREAMING ENDPOINTS =====
+
+// 4. CAMERA FRAME UPLOAD (ESP32-CAM sends JPEG)
+app.post('/api/drone/:droneId/camera/upload', express.raw({type: 'image/jpeg', limit: '500kb'}), (req, res) => {
+  const droneId = req.params.droneId;
+  const timestamp = req.headers['x-timestamp'] || Date.now();
+  
+  if (!drones.has(droneId)) {
+    return res.status(404).json({ error: 'Drone not registered' });
+  }
+  
+  const frameData = req.body;
+  
+  if (!frameData || frameData.length === 0) {
+    return res.status(400).json({ error: 'No frame data' });
+  }
+  
+  // Update drone last seen
+  const drone = drones.get(droneId);
+  drone.lastSeen = Date.now();
+  
+  // Initialize camera storage if needed
+  if (!drone.camera) {
+    drone.camera = {
+      frames: [],
+      lastUpdate: 0,
+      lastFrame: null
+    };
+  }
+  
+  // Store latest frame
+  drone.camera.lastFrame = frameData;
+  drone.camera.lastUpdate = Date.now();
+  
+  // Store in frame history (keep last 10 frames)
+  drone.camera.frames.push({
+    data: frameData,
+    timestamp: timestamp,
+    size: frameData.length
+  });
+  
+  if (drone.camera.frames.length > 10) {
+    drone.camera.frames.shift(); // Remove oldest
+  }
+  
+  console.log(`📸 Camera frame from ${droneId}: ${frameData.length} bytes`);
+  
+  // Broadcast to all web clients
+  io.emit('camera-frame', {
+    droneId: droneId,
+    timestamp: timestamp,
+    size: frameData.length,
+    hasFrame: true
+  });
+  
+  res.json({
+    success: true,
+    received: frameData.length,
+    timestamp: timestamp,
+    frameId: `frame_${timestamp}`
+  });
+});
+
+// 5. GET LATEST CAMERA FRAME (GCS requests)
+app.get('/api/drone/:droneId/camera/latest', (req, res) => {
+  const droneId = req.params.droneId;
+  const drone = drones.get(droneId);
+  
+  if (!drone || !drone.camera || !drone.camera.lastFrame) {
+    return res.status(404).json({ error: 'No camera frame available' });
+  }
+  
+  // Send JPEG image
+  res.set('Content-Type', 'image/jpeg');
+  res.set('X-Drone-ID', droneId);
+  res.set('X-Timestamp', drone.camera.lastUpdate);
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.send(drone.camera.lastFrame);
+});
+
+// 6. CAMERA STATUS ENDPOINT
+app.get('/api/drone/:droneId/camera/status', (req, res) => {
+  const droneId = req.params.droneId;
+  const drone = drones.get(droneId);
+  
+  const status = {
+    hasCamera: !!(drone && drone.camera),
+    lastUpdate: drone?.camera?.lastUpdate || null,
+    frameSize: drone?.camera?.lastFrame?.length || 0,
+    streaming: !!(drone?.camera?.lastUpdate && Date.now() - drone.camera.lastUpdate < 5000),
+    framesInMemory: drone?.camera?.frames?.length || 0
+  };
+  
+  res.json(status);
+});
+
+// 7. GET CAMERA HISTORY (last 10 frames metadata)
+app.get('/api/drone/:droneId/camera/history', (req, res) => {
+  const droneId = req.params.droneId;
+  const drone = drones.get(droneId);
+  
+  if (!drone || !drone.camera) {
+    return res.json({ frames: [] });
+  }
+  
+  const frames = drone.camera.frames.map(f => ({
+    timestamp: f.timestamp,
+    size: f.size,
+    age: Date.now() - parseInt(f.timestamp)
+  }));
+  
+  res.json({
+    droneId: droneId,
+    frames: frames,
+    latestUpdate: drone.camera.lastUpdate
+  });
+});
+
+// 8. WEB CLIENT SEND COMMAND (FROM ANYWHERE)
 app.post('/api/drone/:droneId/command', (req, res) => {
   const droneId = req.params.droneId;
   const { command, priority = 1, params } = req.body;
@@ -218,7 +340,7 @@ app.post('/api/drone/:droneId/command', (req, res) => {
   });
 });
 
-// 5. GET DRONE INFO (PUBLIC STATUS)
+// 9. GET DRONE INFO (PUBLIC STATUS)
 app.get('/api/drone/:droneId', (req, res) => {
   const droneId = req.params.droneId;
   const drone = drones.get(droneId);
@@ -226,6 +348,12 @@ app.get('/api/drone/:droneId', (req, res) => {
   if (!drone) {
     return res.status(404).json({ error: 'Drone not found' });
   }
+  
+  const cameraStatus = drone.camera ? {
+    streaming: Date.now() - drone.camera.lastUpdate < 5000,
+    lastFrame: drone.camera.lastUpdate,
+    frameSize: drone.camera.lastFrame?.length || 0
+  } : { streaming: false };
   
   res.json({
     success: true,
@@ -236,7 +364,8 @@ app.get('/api/drone/:droneId', (req, res) => {
       registered: drone.registeredAt,
       ip: drone.ip,
       firmware: drone.firmware,
-      pendingCommands: drone.commands.length
+      pendingCommands: drone.commands.length,
+      camera: cameraStatus
     }
   });
 });
@@ -270,6 +399,15 @@ io.on('connection', (socket) => {
         serverTime: new Date().toISOString(),
         connectionId: socket.id
       });
+      
+      // Send camera status if drone has camera
+      if (data.droneId && drones.has(data.droneId) && drones.get(data.droneId).camera) {
+        const drone = drones.get(data.droneId);
+        socket.emit('camera-status', {
+          streaming: Date.now() - drone.camera.lastUpdate < 5000,
+          lastUpdate: drone.camera.lastUpdate
+        });
+      }
     }
   });
   
@@ -298,6 +436,25 @@ io.on('connection', (socket) => {
     }
   });
   
+  // Request camera stream
+  socket.on('request-camera', (data) => {
+    const { droneId } = data;
+    
+    if (drones.has(droneId) && drones.get(droneId).camera) {
+      const drone = drones.get(droneId);
+      socket.emit('camera-info', {
+        hasStream: true,
+        lastUpdate: drone.camera.lastUpdate,
+        endpoint: `/api/drone/${droneId}/camera/latest`
+      });
+    } else {
+      socket.emit('camera-info', {
+        hasStream: false,
+        message: 'No camera stream available'
+      });
+    }
+  });
+  
   // Handle disconnection
   socket.on('disconnect', () => {
     const client = connectedClients.get(socket.id);
@@ -317,34 +474,47 @@ app.get('/', (req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
 🌍 ======================================================
-🌍   GLOBAL DRONE CONTROL SERVER - DEPLOYMENT READY
+🌍   GLOBAL DRONE CONTROL SERVER - WITH CAMERA STREAMING
 🌍 ======================================================
 📍 Server URL:  https://your-app.onrender.com
 📍 Local URL:   http://localhost:${PORT}
 📍 Health Check: /health
 📍 Status Page:  /status
 📡 Endpoints:
-   POST /api/drone/register     - Drone registration (4G/WiFi)
-   GET  /api/drone/:id/commands - Poll for commands
-   POST /api/drone/:id/telemetry- Send telemetry
-   POST /api/drone/:id/command  - Send command from anywhere
-   GET  /api/drone/:id          - Get drone status
+   POST /api/drone/register           - Drone registration
+   GET  /api/drone/:id/commands       - Poll for commands
+   POST /api/drone/:id/telemetry      - Send telemetry
+   POST /api/drone/:id/camera/upload  - Upload camera frame
+   GET  /api/drone/:id/camera/latest  - Get latest frame
+   GET  /api/drone/:id/camera/status  - Camera status
+   POST /api/drone/:id/command        - Send command
+   GET  /api/drone/:id                - Get drone status
 🌍 ======================================================
-✅ Ready for GLOBAL control via 4G/WiFi from anywhere!
+✅ Ready for GLOBAL control with LIVE CAMERA STREAMING!
 🌍 ======================================================
   `);
 });
 
-// ===== AUTO CLEANUP (Remove offline drones) =====
+// ===== AUTO CLEANUP (Remove offline drones and old frames) =====
 setInterval(() => {
   const now = Date.now();
   let removed = 0;
   
   for (const [droneId, drone] of drones.entries()) {
-    if (now - drone.lastSeen > 300000) { // 5 minutes offline
+    // Remove drone if offline for 5 minutes
+    if (now - drone.lastSeen > 300000) {
       drones.delete(droneId);
       removed++;
       console.log(`🧹 Removed offline drone: ${droneId}`);
+      continue;
+    }
+    
+    // Clean old camera frames
+    if (drone.camera && drone.camera.frames) {
+      // Remove frames older than 1 minute
+      drone.camera.frames = drone.camera.frames.filter(f => 
+        now - parseInt(f.timestamp) < 60000
+      );
     }
   }
   
