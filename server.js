@@ -173,40 +173,22 @@ app.post('/api/drone/:droneId/telemetry', (req, res) => {
 
 // ===== CAMERA STREAMING ENDPOINTS =====
 
-// 4. CAMERA FRAME UPLOAD (ESP32-CAM sends JPEG) - FIXED VERSION
-app.post('/api/drone/:droneId/camera/upload', (req, res) => {
+// 4. CAMERA FRAME UPLOAD (ESP32-CAM sends JPEG) - ULTRA FAST VERSION
+app.post('/api/drone/:droneId/camera/upload', express.raw({type: 'image/jpeg', limit: '500kb'}), (req, res) => {
   const droneId = req.params.droneId;
+  const frameData = req.body;
+  const timestamp = Date.now();
   
-  console.log(`📸 Camera upload started for ${droneId} from ${req.ip}`);
+  // ULTRA FAST VALIDATION (under 100ms)
+  if (!frameData || frameData.length === 0) {
+    return res.status(400).json({ error: 'No frame data' });
+  }
   
-  // Manual raw data handling (to avoid express.raw() errors)
-  const chunks = [];
-  let totalSize = 0;
-  
-  req.on('data', (chunk) => {
-    chunks.push(chunk);
-    totalSize += chunk.length;
-  });
-  
-  req.on('end', () => {
-    console.log(`✅ Camera upload complete: ${droneId}, ${totalSize} bytes`);
-    
-    if (!drones.has(droneId)) {
-      return res.status(404).json({ error: 'Drone not registered' });
-    }
-    
-    if (totalSize === 0) {
-      return res.status(400).json({ error: 'No frame data received' });
-    }
-    
-    // Update drone last seen
+  // FAST DRONE UPDATE (under 50ms)
+  if (drones.has(droneId)) {
     const drone = drones.get(droneId);
-    drone.lastSeen = Date.now();
+    drone.lastSeen = timestamp;
     
-    // Combine all chunks into JPEG buffer
-    const frameData = Buffer.concat(chunks);
-    
-    // Initialize camera storage if needed
     if (!drone.camera) {
       drone.camera = {
         frames: [],
@@ -215,49 +197,46 @@ app.post('/api/drone/:droneId/camera/upload', (req, res) => {
       };
     }
     
-    // Store latest frame
+    // Store only latest frame (minimal memory)
     drone.camera.lastFrame = frameData;
-    drone.camera.lastUpdate = Date.now();
+    drone.camera.lastUpdate = timestamp;
     
-    // Store in frame history (keep last 10 frames)
+    // Keep only last 2 frames (not 10)
     drone.camera.frames.push({
       data: frameData,
-      timestamp: Date.now(),
+      timestamp: timestamp,
       size: frameData.length
     });
     
-    if (drone.camera.frames.length > 10) {
-      drone.camera.frames.shift(); // Remove oldest
+    if (drone.camera.frames.length > 2) {
+      drone.camera.frames.shift();
     }
-    
-    console.log(`📸 Camera frame stored: ${droneId}, ${frameData.length} bytes`);
-    
-    // Broadcast to all web clients
-    io.emit('camera-frame', {
-      droneId: droneId,
-      timestamp: Date.now(),
-      size: frameData.length,
-      hasFrame: true
-    });
-    
-    res.json({
-      success: true,
-      received: frameData.length,
-      timestamp: Date.now(),
-      frameId: `frame_${Date.now()}`
-    });
+  }
+  
+  // IMMEDIATE RESPONSE (MOST IMPORTANT!)
+  res.json({
+    success: true,
+    received: frameData.length,
+    timestamp: timestamp,
+    frameId: `frame_${timestamp}`
   });
   
-  req.on('error', (err) => {
-    console.error(`❌ Camera upload error for ${droneId}:`, err.message);
-    res.status(500).json({ error: 'Upload failed: ' + err.message });
-  });
+  // Broadcast AFTER response (non-blocking)
+  setTimeout(() => {
+    if (drones.has(droneId)) {
+      io.emit('camera-frame', {
+        droneId: droneId,
+        timestamp: timestamp,
+        size: frameData.length,
+        hasFrame: true
+      });
+    }
+  }, 10);
   
-  // Set longer timeout for large JPEGs
-  req.setTimeout(30000, () => {
-    console.error(`⏰ Camera upload timeout for ${droneId}`);
-    res.status(408).json({ error: 'Upload timeout' });
-  });
+  // Minimal logging to avoid slowdown
+  if (Math.random() < 0.1) { // Log only 10% of frames
+    console.log(`📸 ${droneId}: ${frameData.length} bytes`);
+  }
 });
 
 // 5. GET LATEST CAMERA FRAME (GCS requests)
