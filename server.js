@@ -173,70 +173,91 @@ app.post('/api/drone/:droneId/telemetry', (req, res) => {
 
 // ===== CAMERA STREAMING ENDPOINTS =====
 
-// 4. CAMERA FRAME UPLOAD (ESP32-CAM sends JPEG) - ULTRA FAST VERSION
-app.post('/api/drone/:droneId/camera/upload', express.raw({type: 'image/jpeg', limit: '500kb'}), (req, res) => {
+// 4. CAMERA FRAME UPLOAD (ESP32-CAM sends JPEG) - WORKING VERSION
+app.post('/api/drone/:droneId/camera/upload', (req, res) => {
   const droneId = req.params.droneId;
-  const frameData = req.body;
   const timestamp = Date.now();
   
-  // ULTRA FAST VALIDATION (under 100ms)
-  if (!frameData || frameData.length === 0) {
-    return res.status(400).json({ error: 'No frame data' });
-  }
+  console.log(`📸 Camera upload starting for ${droneId}`);
   
-  // FAST DRONE UPDATE (under 50ms)
-  if (drones.has(droneId)) {
-    const drone = drones.get(droneId);
-    drone.lastSeen = timestamp;
-    
-    if (!drone.camera) {
-      drone.camera = {
-        frames: [],
-        lastUpdate: 0,
-        lastFrame: null
-      };
-    }
-    
-    // Store only latest frame (minimal memory)
-    drone.camera.lastFrame = frameData;
-    drone.camera.lastUpdate = timestamp;
-    
-    // Keep only last 2 frames (not 10)
-    drone.camera.frames.push({
-      data: frameData,
-      timestamp: timestamp,
-      size: frameData.length
-    });
-    
-    if (drone.camera.frames.length > 2) {
-      drone.camera.frames.shift();
-    }
-  }
+  let frameData = Buffer.alloc(0);
+  let receivedBytes = 0;
   
-  // IMMEDIATE RESPONSE (MOST IMPORTANT!)
-  res.json({
-    success: true,
-    received: frameData.length,
-    timestamp: timestamp,
-    frameId: `frame_${timestamp}`
+  req.on('data', (chunk) => {
+    receivedBytes += chunk.length;
+    frameData = Buffer.concat([frameData, chunk]);
   });
   
-  // Broadcast AFTER response (non-blocking)
-  setTimeout(() => {
-    if (drones.has(droneId)) {
-      io.emit('camera-frame', {
-        droneId: droneId,
-        timestamp: timestamp,
-        size: frameData.length,
-        hasFrame: true
-      });
+  req.on('end', () => {
+    console.log(`✅ Camera upload complete: ${droneId}, ${receivedBytes} bytes`);
+    
+    // VALIDATION
+    if (receivedBytes === 0) {
+      return res.status(400).json({ error: 'No frame data' });
     }
-  }, 10);
+    
+    if (receivedBytes > 500000) { // 500KB limit
+      return res.status(400).json({ error: 'Frame too large' });
+    }
+    
+    // FAST DRONE UPDATE
+    if (drones.has(droneId)) {
+      const drone = drones.get(droneId);
+      drone.lastSeen = timestamp;
+      
+      if (!drone.camera) {
+        drone.camera = {
+          frames: [],
+          lastUpdate: 0,
+          lastFrame: null
+        };
+      }
+      
+      drone.camera.lastFrame = frameData;
+      drone.camera.lastUpdate = timestamp;
+      
+      // Keep only last 2 frames
+      drone.camera.frames.push({
+        data: frameData,
+        timestamp: timestamp,
+        size: frameData.length
+      });
+      
+      if (drone.camera.frames.length > 2) {
+        drone.camera.frames.shift();
+      }
+    }
+    
+    // IMMEDIATE RESPONSE (CRITICAL!)
+    res.json({
+      success: true,
+      received: receivedBytes,
+      timestamp: timestamp,
+      frameId: `frame_${timestamp}`
+    });
+    
+    // Broadcast AFTER response
+    setTimeout(() => {
+      if (drones.has(droneId)) {
+        io.emit('camera-frame', {
+          droneId: droneId,
+          timestamp: timestamp,
+          size: receivedBytes,
+          hasFrame: true
+        });
+      }
+    }, 10);
+  });
   
-  // Minimal logging to avoid slowdown
-  if (Math.random() < 0.1) { // Log only 10% of frames
-    console.log(`📸 ${droneId}: ${frameData.length} bytes`);
-  }
+  req.on('error', (err) => {
+    console.error(`❌ Camera upload error for ${droneId}:`, err.message);
+    res.status(500).json({ error: 'Upload failed' });
+  });
+  
+  // 30 second timeout
+  req.setTimeout(30000, () => {
+    console.error(`⏰ Camera upload timeout for ${droneId}`);
+  });
 });
 
 // 5. GET LATEST CAMERA FRAME (GCS requests)
