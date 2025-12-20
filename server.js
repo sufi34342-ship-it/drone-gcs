@@ -173,64 +173,90 @@ app.post('/api/drone/:droneId/telemetry', (req, res) => {
 
 // ===== CAMERA STREAMING ENDPOINTS =====
 
-// 4. CAMERA FRAME UPLOAD (ESP32-CAM sends JPEG)
-app.post('/api/drone/:droneId/camera/upload', express.raw({type: 'image/jpeg', limit: '500kb'}), (req, res) => {
+// 4. CAMERA FRAME UPLOAD (ESP32-CAM sends JPEG) - FIXED VERSION
+app.post('/api/drone/:droneId/camera/upload', (req, res) => {
   const droneId = req.params.droneId;
-  const timestamp = req.headers['x-timestamp'] || Date.now();
   
-  if (!drones.has(droneId)) {
-    return res.status(404).json({ error: 'Drone not registered' });
-  }
+  console.log(`📸 Camera upload started for ${droneId} from ${req.ip}`);
   
-  const frameData = req.body;
+  // Manual raw data handling (to avoid express.raw() errors)
+  const chunks = [];
+  let totalSize = 0;
   
-  if (!frameData || frameData.length === 0) {
-    return res.status(400).json({ error: 'No frame data' });
-  }
-  
-  // Update drone last seen
-  const drone = drones.get(droneId);
-  drone.lastSeen = Date.now();
-  
-  // Initialize camera storage if needed
-  if (!drone.camera) {
-    drone.camera = {
-      frames: [],
-      lastUpdate: 0,
-      lastFrame: null
-    };
-  }
-  
-  // Store latest frame
-  drone.camera.lastFrame = frameData;
-  drone.camera.lastUpdate = Date.now();
-  
-  // Store in frame history (keep last 10 frames)
-  drone.camera.frames.push({
-    data: frameData,
-    timestamp: timestamp,
-    size: frameData.length
+  req.on('data', (chunk) => {
+    chunks.push(chunk);
+    totalSize += chunk.length;
   });
   
-  if (drone.camera.frames.length > 10) {
-    drone.camera.frames.shift(); // Remove oldest
-  }
-  
-  console.log(`📸 Camera frame from ${droneId}: ${frameData.length} bytes`);
-  
-  // Broadcast to all web clients
-  io.emit('camera-frame', {
-    droneId: droneId,
-    timestamp: timestamp,
-    size: frameData.length,
-    hasFrame: true
+  req.on('end', () => {
+    console.log(`✅ Camera upload complete: ${droneId}, ${totalSize} bytes`);
+    
+    if (!drones.has(droneId)) {
+      return res.status(404).json({ error: 'Drone not registered' });
+    }
+    
+    if (totalSize === 0) {
+      return res.status(400).json({ error: 'No frame data received' });
+    }
+    
+    // Update drone last seen
+    const drone = drones.get(droneId);
+    drone.lastSeen = Date.now();
+    
+    // Combine all chunks into JPEG buffer
+    const frameData = Buffer.concat(chunks);
+    
+    // Initialize camera storage if needed
+    if (!drone.camera) {
+      drone.camera = {
+        frames: [],
+        lastUpdate: 0,
+        lastFrame: null
+      };
+    }
+    
+    // Store latest frame
+    drone.camera.lastFrame = frameData;
+    drone.camera.lastUpdate = Date.now();
+    
+    // Store in frame history (keep last 10 frames)
+    drone.camera.frames.push({
+      data: frameData,
+      timestamp: Date.now(),
+      size: frameData.length
+    });
+    
+    if (drone.camera.frames.length > 10) {
+      drone.camera.frames.shift(); // Remove oldest
+    }
+    
+    console.log(`📸 Camera frame stored: ${droneId}, ${frameData.length} bytes`);
+    
+    // Broadcast to all web clients
+    io.emit('camera-frame', {
+      droneId: droneId,
+      timestamp: Date.now(),
+      size: frameData.length,
+      hasFrame: true
+    });
+    
+    res.json({
+      success: true,
+      received: frameData.length,
+      timestamp: Date.now(),
+      frameId: `frame_${Date.now()}`
+    });
   });
   
-  res.json({
-    success: true,
-    received: frameData.length,
-    timestamp: timestamp,
-    frameId: `frame_${timestamp}`
+  req.on('error', (err) => {
+    console.error(`❌ Camera upload error for ${droneId}:`, err.message);
+    res.status(500).json({ error: 'Upload failed: ' + err.message });
+  });
+  
+  // Set longer timeout for large JPEGs
+  req.setTimeout(30000, () => {
+    console.error(`⏰ Camera upload timeout for ${droneId}`);
+    res.status(408).json({ error: 'Upload timeout' });
   });
 });
 
